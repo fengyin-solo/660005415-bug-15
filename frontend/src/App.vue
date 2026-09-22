@@ -11,6 +11,7 @@
         <el-button size="small" type="warning" @click="store.detect()" :disabled="!store.result">⚠ 检测异常</el-button>
       </div>
     </header>
+    <RulePanel />
     <div class="main-grid">
       <div class="grid-col">
         <LogTable />
@@ -29,6 +30,7 @@
 
 <script setup lang="ts">
 import LogTable from './components/LogTable.vue'
+import RulePanel from './components/RulePanel.vue'
 import AnomalyChart from './components/AnomalyChart.vue'
 import AlertPanel from './components/AlertPanel.vue'
 import TrendChart from './components/TrendChart.vue'

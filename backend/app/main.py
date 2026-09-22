@@ -75,6 +75,43 @@ class DetectRequest(BaseModel):
     query: str = ""
 
 
+MAX_KEYWORD_LEN = 64
+
+
+def parse_keywords(raw):
+    """Normalize a keyword rule's vocabulary into a de-duplicated list of non-empty tokens.
+
+    Accepts a list or a string separated by newlines / commas (incl. Chinese) / semicolons.
+    Whitespace-only and over-long tokens are filtered out.
+    """
+    if isinstance(raw, str):
+        parts = re.split(r'[\n,，;；、]+', raw)
+    elif isinstance(raw, (list, tuple, set)):
+        parts = []
+        for item in raw:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                parts.extend(re.split(r'[\n,，;；、]+', item))
+            else:
+                parts.append(str(item))
+    else:
+        return []
+
+    seen = set()
+    keywords = []
+    for part in parts:
+        kw = part.strip()
+        if not kw or len(kw) > MAX_KEYWORD_LEN:
+            continue
+        key = kw.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        keywords.append(kw)
+    return keywords
+
+
 @app.post("/api/generate")
 def generate_logs(req: GenerateRequest):
     tmpl = LOG_TEMPLATES.get(req.type, LOG_TEMPLATES["nginx"])
@@ -100,6 +137,11 @@ def detect_anomalies(req: DetectRequest):
 def analyze_logs(logs_data, rules, query):
     logs = logs_data
     n = len(logs)
+
+    # Drop keyword markers left over from a previous analysis round
+    for log in logs:
+        if isinstance(log, dict):
+            log.pop("matchedKeywords", None)
 
     # Time windows (1min each for demonstration)
     window_size = 20
@@ -141,16 +183,85 @@ def analyze_logs(logs_data, rules, query):
 
     # Alert rules
     alerts = []
+    keyword_hits = []
+    detect_errors = []
     for i, rule in enumerate(rules):
         rule = rule if isinstance(rule, dict) else {}
+        rule_type = rule.get("type")
+
+        # Keyword hit rule: one shared normalized vocabulary feeds both the
+        # per-log hit list and the per-window count-based judgement.
+        if rule_type == "keyword":
+            keywords = parse_keywords(rule.get("keywords"))
+            rule_name = rule.get("name", "关键词命中")
+            if not keywords:
+                detect_errors.append({
+                    "code": "EMPTY_KEYWORDS",
+                    "ruleId": rule.get("id", i + 1),
+                    "ruleName": rule_name,
+                    "message": f"规则「{rule_name}」的词表为空或全部为无效关键词（空串/超长），已跳过检测，请补充词表后重试"
+                })
+                continue
+
+            try:
+                threshold = int(rule.get("threshold", 0))
+            except (TypeError, ValueError):
+                threshold = 0
+
+            for w in windows:
+                chunk = logs[w["start"]:w["end"]]
+                hit_logs = []
+                kw_counts: Counter = Counter()
+                for log in chunk:
+                    if not isinstance(log, dict):
+                        continue
+                    text = f'{log.get("raw", "")}\n{log.get("message", "")}'.lower()
+                    matched = [kw for kw in keywords if kw.lower() in text]
+                    if not matched:
+                        continue
+                    existing = log.get("matchedKeywords")
+                    if isinstance(existing, list):
+                        for kw in matched:
+                            if kw not in existing:
+                                existing.append(kw)
+                    else:
+                        log["matchedKeywords"] = list(matched)
+                    hit_logs.append(log)
+                    for kw in matched:
+                        kw_counts[kw] += 1
+
+                if not hit_logs:
+                    continue
+
+                hit_count = len(hit_logs)
+                keyword_hits.append({
+                    "ruleId": rule.get("id", i + 1),
+                    "ruleName": rule_name,
+                    "windowIndex": w["start"] // window_size,
+                    "count": hit_count,
+                    "keywords": dict(kw_counts),
+                    "logIds": [log.get("id") for log in hit_logs],
+                    "timestamp": hit_logs[0].get("timestamp", "")
+                })
+
+                if hit_count > threshold:
+                    top = "、".join(f"{k}×{c}" for k, c in kw_counts.most_common(3))
+                    alerts.append({
+                        "id": len(alerts) + 1, "ruleName": rule_name,
+                        "severity": "high",
+                        "message": f"窗口{w['start']}内{hit_count}条日志命中关键词（{top}），超过阈值{threshold}",
+                        "timestamp": time.strftime("%H:%M:%S")
+                    })
+            continue
+
         for w in windows:
-            if rule.get("type") == "level" and w["levels"].get("ERROR", 0) > rule.get("threshold", 5):
+            if rule_type == "level" and w["levels"].get("ERROR", 0) > rule.get("threshold", 5):
                 alerts.append({
                     "id": len(alerts) + 1, "ruleName": rule.get("name", "高频ERROR"),
                     "severity": "high", "message": f"窗口{w['start']}内ERROR日志{w['levels']['ERROR']}条超过阈值{rule.get('threshold',5)}",
                     "timestamp": time.strftime("%H:%M:%S")
                 })
-            if rule.get("type") == "count" and w["count"] > rule.get("threshold", 200):
+            if rule_type == "count" and w["count"] > rule.get("threshold", 200):
                 alerts.append({
                     "id": len(alerts) + 1, "ruleName": rule.get("name", "异常流量"),
                     "severity": "medium", "message": f"窗口{w['start']}日志量{w['count']}超过阈值",
@@ -183,5 +294,7 @@ def analyze_logs(logs_data, rules, query):
         "windows": windows,
         "anomalies": anomalies,
         "alerts": alerts[:20],
+        "keywordHits": keyword_hits,
+        "errors": detect_errors,
         "totalLogs": n
     }
