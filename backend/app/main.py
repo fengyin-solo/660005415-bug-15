@@ -1,7 +1,8 @@
 import re, math, time, random
+from typing import Union, List, Optional
 import numpy as np
 from collections import defaultdict, Counter
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -73,6 +74,31 @@ class DetectRequest(BaseModel):
     logs: list
     rules: list = []
     query: str = ""
+    # 词表允许字符串（前端文本框，逗号/分号/换行分隔）或列表
+    keywords: Optional[Union[List, str]] = None
+
+
+def normalize_keywords(raw):
+    """词表统一归一化：支持字符串（逗号/分号/空白/换行分隔）或列表，
+    去重保序、去除包裹引号。中文关键词（含中文的整项）原样保留。"""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        tokens = re.split(r'[,，;；\n\r\t]+', raw)
+    else:
+        tokens = []
+        for item in raw:
+            if item is None:
+                continue
+            tokens.extend(re.split(r'[,，;；\n\r\t]+', str(item)))
+    result = []
+    seen = set()
+    for tok in tokens:
+        kw = tok.strip().strip('"\'').strip()
+        if kw and kw not in seen:
+            seen.add(kw)
+            result.append(kw)
+    return result
 
 
 @app.post("/api/generate")
@@ -94,12 +120,54 @@ def generate_logs(req: GenerateRequest):
 
 @app.post("/api/detect")
 def detect_anomalies(req: DetectRequest):
-    return analyze_logs(req.logs, req.rules, req.query)
+    try:
+        return analyze_logs(req.logs, req.rules, req.query, req.keywords)
+    except ValueError as e:
+        # 词表为空或全部被过滤掉：返回结构化异常说明，前端据此提示并支持重试
+        raise HTTPException(status_code=400, detail={
+            "code": "EMPTY_KEYWORDS",
+            "message": str(e)
+        })
 
 
-def analyze_logs(logs_data, rules, query):
+def analyze_logs(logs_data, rules, query, keywords_raw=None):
     logs = logs_data
     n = len(logs)
+
+    # 第三条规则（关键词命中）。条数类判定与逐词命中共用同一份词表
+    keyword_rules = [r for r in rules if isinstance(r, dict) and r.get("type") == "keyword"]
+    keyword_vocab = []
+    if keyword_rules:
+        # 字符串词表（文本框输入）整体交给归一化按分隔符拆分，不能 list() 逐字符拆散
+        if isinstance(keywords_raw, str):
+            vocab_terms = [keywords_raw]
+        else:
+            vocab_terms = list(keywords_raw or [])
+        for r in keyword_rules:
+            kw_field = r.get("keywords", [])
+            if isinstance(kw_field, str):
+                vocab_terms.append(kw_field)
+            elif kw_field:
+                vocab_terms.extend(kw_field)
+        keyword_vocab = normalize_keywords(vocab_terms)
+        if not keyword_vocab:
+            raise ValueError(
+                "关键词词表为空：请填写至少一个有效关键词后重试（多个关键词可用逗号、分号或换行分隔）"
+            )
+        keyword_threshold = max(1, int(keyword_rules[0].get("threshold", 1) or 1))
+    keyword_active = bool(keyword_rules) and bool(keyword_vocab)
+    keyword_lower = [k.lower() for k in keyword_vocab]
+
+    # 逐日志关键词命中（纯子串匹配，不区分 ASCII 大小写，中文按原文匹配）；
+    # 同一份匹配结果同时服务于"命中条目"与"条数类窗口判定"
+    per_keyword_hits = Counter()
+    if keyword_active:
+        for log in logs:
+            raw_lower = str(log.get("raw", "")).lower()
+            matched = [kw for kw, kw_l in zip(keyword_vocab, keyword_lower) if kw_l in raw_lower]
+            log["matchedKeywords"] = matched
+            if matched:
+                per_keyword_hits.update(matched)
 
     # Time windows (1min each for demonstration)
     window_size = 20
@@ -108,11 +176,15 @@ def analyze_logs(logs_data, rules, query):
         chunk = logs[i:i + window_size]
         levels = Counter(l["level"] for l in chunk)
         sources = Counter(l["source"] for l in chunk)
+        hit_logs = [l for l in chunk if l.get("matchedKeywords")]
+        window_hits = Counter(k for l in hit_logs for k in l["matchedKeywords"])
         windows.append({
             "start": i, "end": min(i + window_size, n),
             "count": len(chunk),
             "levels": dict(levels),
-            "sources": dict(sources)
+            "sources": dict(sources),
+            "keywordHits": len(hit_logs),
+            "keywordByTerm": dict(window_hits)
         })
 
     # 3-sigma + IQR anomaly detection
@@ -141,6 +213,7 @@ def analyze_logs(logs_data, rules, query):
 
     # Alert rules
     alerts = []
+    keyword_rule_name = keyword_rules[0].get("name", "关键词命中") if keyword_active else ""
     for i, rule in enumerate(rules):
         rule = rule if isinstance(rule, dict) else {}
         for w in windows:
@@ -156,6 +229,30 @@ def analyze_logs(logs_data, rules, query):
                     "severity": "medium", "message": f"窗口{w['start']}日志量{w['count']}超过阈值",
                     "timestamp": time.strftime("%H:%M:%S")
                 })
+            # 关键词条数类判定：与逐词命中共用同一份词表与同一次匹配结果
+            if rule.get("type") == "keyword" and keyword_active and w["keywordHits"] >= keyword_threshold:
+                top_terms = sorted(w["keywordByTerm"].items(), key=lambda x: x[1], reverse=True)
+                terms_desc = "、".join(f"{t}×{c}" for t, c in top_terms[:3])
+                alerts.append({
+                    "id": len(alerts) + 1, "ruleName": rule.get("name", "关键词命中"),
+                    "severity": "medium",
+                    "message": f"窗口{w['start']}关键词命中{w['keywordHits']}条日志（{terms_desc}），达到条数阈值{keyword_threshold}",
+                    "timestamp": time.strftime("%H:%M:%S")
+                })
+
+    # 逐关键词命中告警（同一关键词命中多条日志时给出总条数与分布窗口数），
+    # 与窗口条数判定互为依据
+    if keyword_active:
+        for kw in keyword_vocab:
+            hit_count = per_keyword_hits.get(kw, 0)
+            if hit_count > 0:
+                hit_windows = sum(1 for w in windows if w["keywordByTerm"].get(kw))
+                alerts.append({
+                    "id": len(alerts) + 1, "ruleName": keyword_rule_name,
+                    "severity": "info",
+                    "message": f"关键词「{kw}」共命中{hit_count}条日志，分布于{hit_windows}个窗口",
+                    "timestamp": time.strftime("%H:%M:%S")
+                })
 
     # Full-text search with TF-IDF
     if query:
@@ -168,6 +265,10 @@ def analyze_logs(logs_data, rules, query):
                 scored.append((score, log))
         logs = [l for _, l in sorted(scored, key=lambda x: x[0], reverse=True)]
 
+    # 关键词规则启用时命中条目优先展示，保证命中日志一定出现在结果列表中
+    if keyword_active:
+        logs = sorted(logs, key=lambda l: (-len(l.get("matchedKeywords") or []), l.get("id", 0)))
+
     # Add non-rule alerts for high anomaly windows  
     for a in anomalies:
         if a["isAnomaly"]:
@@ -178,10 +279,22 @@ def analyze_logs(logs_data, rules, query):
                 "timestamp": a["timestamp"]
             })
 
+    keyword_summary = None
+    if keyword_active:
+        hit_log_count = sum(1 for l in logs if l.get("matchedKeywords"))
+        keyword_summary = {
+            "keywords": keyword_vocab,
+            "hitLogs": hit_log_count,
+            "hitWindows": sum(1 for w in windows if w["keywordHits"] > 0),
+            "byTerm": {kw: per_keyword_hits.get(kw, 0) for kw in keyword_vocab},
+            "threshold": keyword_threshold
+        }
+
     return {
         "logs": logs[:200],
         "windows": windows,
         "anomalies": anomalies,
-        "alerts": alerts[:20],
-        "totalLogs": n
+        "alerts": alerts[:50],
+        "totalLogs": n,
+        "keywordSummary": keyword_summary
     }
